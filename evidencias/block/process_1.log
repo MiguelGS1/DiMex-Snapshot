@@ -1,0 +1,2 @@
+process 1 listening at 127.0.0.1:5301, peers=3
+process 1 blocked waiting for replies, accesses=0
