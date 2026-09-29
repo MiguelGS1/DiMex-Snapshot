@@ -37,8 +37,8 @@ else
   echo "The unsafe fault did not appear in a snapshot (INV1)." >&2
   exit 1
  fi
- if [[ "$mode" == block ]] && ! grep -q 'INV6' <<<"$result"; then
-  echo "The blocked fault did not appear in a snapshot (INV6)." >&2
+ if [[ "$mode" == block ]] && ! grep -q 'INV5' <<<"$result"; then
+  echo "The blocked fault did not appear in a snapshot (INV5)." >&2
   exit 1
  fi
  echo "The injected fault was detected in snapshots (nonzero checker exit is expected)."

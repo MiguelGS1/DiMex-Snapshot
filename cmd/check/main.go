@@ -70,9 +70,8 @@ func main() {
 		{"INV2 all noMX implies no pending protocol", Inv2, inv2},
 		{"INV3 deferred request belongs to an active requester", Inv3, inv3},
 		{"INV4 request accounting per peer", Inv4, inv4},
-		{"INV5 noMX cannot defer a reply", Inv5, inv5},
-		{"INV6 priority wait graph is acyclic", Inv6, inv6},
-		{"INV7 inMX received all replies", Inv7, inv7},
+		{"INV5 only a process with priority may defer", Inv5, inv5},
+		{"INV6 inMX received all replies", Inv6, inv6},
 	}
 	good, missing := 0, 0
 	var violations []violation
@@ -132,7 +131,6 @@ func Inv3(s global) bool { return len(inv3(s)) == 0 }
 func Inv4(s global) bool { return len(inv4(s)) == 0 }
 func Inv5(s global) bool { return len(inv5(s)) == 0 }
 func Inv6(s global) bool { return len(inv6(s)) == 0 }
-func Inv7(s global) bool { return len(inv7(s)) == 0 }
 func inv1(s global) []string {
 	count := 0
 	for _, p := range s {
@@ -210,47 +208,32 @@ func inv4(s global) []string {
 	}
 	return out
 }
+
+// A process may only defer a reply to q while it is inside the critical section,
+// or while it wants it and its own request has priority over q's. This is the
+// reply condition of the algorithm stated as an assertion, so it also covers the
+// case of a noMX process deferring.
 func inv5(s global) []string {
 	var out []string
-	for q, p := range s {
-		if p.Local.State == DIMEX.NoMX {
-			for id, ts := range p.Local.Waiting {
-				if ts != 0 {
-					out = append(out, fmt.Sprintf("p%d noMX deferred p%d", q, id))
-				}
+	for p, proc := range s {
+		for q, ts := range proc.Local.Waiting {
+			if ts == 0 || proc.Local.State == DIMEX.InMX {
+				continue
 			}
+			if proc.Local.State == DIMEX.WantMX && before(p, proc.Local.RequestTS, q, ts) {
+				continue
+			}
+			out = append(out, fmt.Sprintf("p%d (%s, ts=%d) deferred p%d (ts=%d) without priority",
+				p, proc.Local.State, proc.Local.RequestTS, q, ts))
 		}
 	}
 	return out
 }
+
+// Same total order the DIMEX module uses to decide who goes first.
+func before(id1, ts1, id2, ts2 int) bool { return ts1 < ts2 || (ts1 == ts2 && id1 < id2) }
+
 func inv6(s global) []string {
-	// Edge p->q: requester p is waiting for q, which deferred its reply.
-	color := make(map[int]int)
-	var visit func(int) bool
-	visit = func(p int) bool {
-		color[p] = 1
-		for q, other := range s {
-			if q == p || s[p].Local.State != DIMEX.WantMX || other.Local.Waiting[p] != s[p].Local.RequestTS {
-				continue
-			}
-			if color[q] == 1 {
-				return true
-			}
-			if color[q] == 0 && visit(q) {
-				return true
-			}
-		}
-		color[p] = 2
-		return false
-	}
-	for p := range s {
-		if color[p] == 0 && visit(p) {
-			return []string{"cycle in deferred-reply wait graph"}
-		}
-	}
-	return nil
-}
-func inv7(s global) []string {
 	var out []string
 	for p, proc := range s {
 		if proc.Local.State == DIMEX.InMX {
