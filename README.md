@@ -36,3 +36,24 @@ wc -l runs/normal/snapshots/process_*.jsonl
 ```
 
 O comando deve mostrar 250 linhas em cada um dos três arquivos.
+
+## Rodar à mão, em terminais separados
+
+O script acima sobe os três processos de uma vez e os encerra sozinho depois de alguns
+segundos. Para rodar como no template da professora — um processo por terminal, até o
+usuário interromper — use `--duration=0`, que faz cada processo rodar até o `Ctrl+C`:
+
+```bash
+go build -o bin/dimex ./cmd/dimex
+bin/dimex --duration=0 --snapshots=snapshots --file=mxOUT.txt 0 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002
+bin/dimex --duration=0 --snapshots=snapshots --file=mxOUT.txt 1 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002
+bin/dimex --duration=0 --snapshots=snapshots --file=mxOUT.txt 2 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002
+```
+
+Cada linha vai num terminal diferente, e a ordem não importa: quem sobe primeiro espera os
+outros. Depois do `Ctrl+C` em todos, confira o resultado com:
+
+```bash
+go build -o bin/check ./cmd/check
+bin/check --snapshots=snapshots --file=mxOUT.txt --n=3
+```
