@@ -49,7 +49,15 @@ func NewPP2PLink(addresses []string, id int) (*PP2PLink, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &PP2PLink{Req: make(chan ReqMessage, 4096), Ind: make(chan IndMessage), id: id, addresses: addresses, queues: make([]chan string, len(addresses)), last: make([]uint64, len(addresses)), listener: l}
+	p := &PP2PLink{
+		Req:       make(chan ReqMessage, 4096),
+		Ind:       make(chan IndMessage),
+		id:        id,
+		addresses: addresses,
+		queues:    make([]chan string, len(addresses)),
+		last:      make([]uint64, len(addresses)),
+		listener:  l,
+	}
 	for i := range addresses {
 		if i != id {
 			p.queues[i] = make(chan string, 4096)

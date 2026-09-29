@@ -72,7 +72,8 @@ func NewDIMEX(addresses []string, id int, snapshotDir, fault string) (*DIMEX_Mod
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		return nil, err
 	}
-	f, e := os.OpenFile(filepath.Join(snapshotDir, fmt.Sprintf("process_%d.jsonl", id)), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	path := filepath.Join(snapshotDir, fmt.Sprintf("process_%d.jsonl", id))
+	f, e := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if e != nil {
 		return nil, e
 	}
@@ -81,7 +82,20 @@ func NewDIMEX(addresses []string, id int, snapshotDir, fault string) (*DIMEX_Mod
 		f.Close()
 		return nil, e
 	}
-	m := &DIMEX_Module{Req: make(chan dmxReq, 1), Ind: make(chan dmxResp, 1), SnapshotReq: make(chan int, 1024), Pp2plink: pl, id: id, n: len(addresses), st: NoMX, responses: make([]bool, len(addresses)), waiting: make([]int, len(addresses)), active: make(map[int]*Snapshot), file: f, fault: fault}
+	m := &DIMEX_Module{
+		Req:         make(chan dmxReq, 1),
+		Ind:         make(chan dmxResp, 1),
+		SnapshotReq: make(chan int, 1024),
+		Pp2plink:    pl,
+		id:          id,
+		n:           len(addresses),
+		st:          NoMX,
+		responses:   make([]bool, len(addresses)),
+		waiting:     make([]int, len(addresses)),
+		active:      make(map[int]*Snapshot),
+		file:        f,
+		fault:       fault,
+	}
 	go m.run()
 	return m, nil
 }
@@ -207,7 +221,19 @@ func (m *DIMEX_Module) startSnapshot(id, firstFrom int) {
 	if _, exists := m.active[id]; exists {
 		return
 	}
-	s := &Snapshot{SnapshotID: id, ProcessID: m.id, Local: LocalState{State: m.st, Clock: m.lcl, RequestTS: m.reqTs, Responses: append([]bool(nil), m.responses...), Waiting: append([]int(nil), m.waiting...)}, Channels: make(map[int][]Message), closed: make(map[int]bool)}
+	s := &Snapshot{
+		SnapshotID: id,
+		ProcessID:  m.id,
+		Local: LocalState{
+			State:     m.st,
+			Clock:     m.lcl,
+			RequestTS: m.reqTs,
+			Responses: append([]bool(nil), m.responses...),
+			Waiting:   append([]int(nil), m.waiting...),
+		},
+		Channels: make(map[int][]Message),
+		closed:   make(map[int]bool),
+	}
 	m.active[id] = s
 	for i := 0; i < m.n; i++ {
 		if i != m.id {
