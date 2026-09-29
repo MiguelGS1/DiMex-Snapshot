@@ -116,8 +116,15 @@ func main() {
 	}
 	doubleBars := strings.Count(string(b), "||")
 	doubleDots := strings.Count(string(b), "..")
+	// A process interrupted with Ctrl+C inside the critical section leaves a final
+	// "|" with no matching "."; that is an unfinished access, not a mutual
+	// exclusion violation, so it does not fail the check.
+	unfinished := len(b)%2 != 0 && b[len(b)-1] == '|'
 	fmt.Printf("shared file: %d bytes, %d two-byte positions, ||= %d, ..= %d, invalid positions=%d\n", len(b), len(b)/2, doubleBars, doubleDots, malformed)
-	if len(violations) > 0 || good < *min || missing > 0 || malformed > 0 || len(b)%2 != 0 {
+	if unfinished {
+		fmt.Println("note: the file ends with an unfinished access (a process was interrupted inside the critical section)")
+	}
+	if len(violations) > 0 || good < *min || missing > 0 || malformed > 0 || (len(b)%2 != 0 && !unfinished) {
 		os.Exit(1)
 	}
 }
