@@ -12,59 +12,67 @@ import (
 	"strings"
 )
 
-type global map[int]DIMEX.Snapshot
+// Cada ID de processo aponta para seu estado no mesmo corte global.
+type globalSnapshot map[int]DIMEX.Snapshot
+
 type violation struct {
-	Snapshot     int
-	Name, Detail string
+	SnapshotID int
+	Name       string
+	Detail     string
 }
-type invariant func(global) []string
+
+type invariantReasons func(globalSnapshot) []string
 
 func main() {
-	dir := flag.String("snapshots", "snapshots", "per-process JSONL directory")
-	file := flag.String("file", "mxOUT.txt", "shared output file")
-	n := flag.Int("n", 3, "number of processes")
-	min := flag.Int("min", 1, "minimum complete snapshots required")
+	snapshotDir := flag.String("snapshots", "snapshots", "per-process JSONL directory")
+	outputPath := flag.String("file", "mxOUT.txt", "shared output file")
+	processCount := flag.Int("n", 3, "number of processes")
+	minSnapshots := flag.Int("min", 1, "minimum complete snapshots required")
 	flag.Parse()
-	if *n < 1 || *min < 0 {
+	if *processCount < 1 || *minSnapshots < 0 {
 		fail("invalid n or min")
 	}
-	all := make(map[int]global)
-	for p := 0; p < *n; p++ {
-		path := filepath.Join(*dir, fmt.Sprintf("process_%d.jsonl", p))
-		f, e := os.Open(path)
-		if e != nil {
-			fail(e.Error())
+
+	snapshotsByID := make(map[int]globalSnapshot)
+	for processID := 0; processID < *processCount; processID++ {
+		snapshotPath := filepath.Join(*snapshotDir, fmt.Sprintf("process_%d.jsonl", processID))
+		snapshotFile, err := os.Open(snapshotPath)
+		if err != nil {
+			fail(err.Error())
 		}
-		scanner := bufio.NewScanner(f)
+		scanner := bufio.NewScanner(snapshotFile)
 		scanner.Buffer(make([]byte, 4096), 10*1024*1024)
 		for scanner.Scan() {
-			var s DIMEX.Snapshot
-			if e := json.Unmarshal(scanner.Bytes(), &s); e != nil {
-				fail(fmt.Sprintf("%s: %v", path, e))
+			var snapshot DIMEX.Snapshot
+			if err := json.Unmarshal(scanner.Bytes(), &snapshot); err != nil {
+				fail(fmt.Sprintf("%s: %v", snapshotPath, err))
 			}
-			if s.ProcessID != p || s.SnapshotID <= 0 {
-				fail(fmt.Sprintf("%s: invalid snapshot ID or process ID", path))
+			if snapshot.ProcessID != processID || snapshot.SnapshotID <= 0 {
+				fail(fmt.Sprintf("%s: invalid snapshot ID or process ID", snapshotPath))
 			}
-			if len(s.Local.Responses) != *n || len(s.Local.Waiting) != *n || len(s.Channels) != *n-1 {
-				fail(fmt.Sprintf("%s: malformed arrays or channels in snapshot %d", path, s.SnapshotID))
+			if len(snapshot.Local.Responses) != *processCount ||
+				len(snapshot.Local.Waiting) != *processCount ||
+				len(snapshot.Channels) != *processCount-1 {
+				fail(fmt.Sprintf("%s: malformed arrays or channels in snapshot %d", snapshotPath, snapshot.SnapshotID))
 			}
-			if all[s.SnapshotID] == nil {
-				all[s.SnapshotID] = make(global)
+			if snapshotsByID[snapshot.SnapshotID] == nil {
+				snapshotsByID[snapshot.SnapshotID] = make(globalSnapshot)
 			}
-			if _, duplicate := all[s.SnapshotID][p]; duplicate {
-				fail(fmt.Sprintf("%s: repeated snapshot %d", path, s.SnapshotID))
+			if _, duplicate := snapshotsByID[snapshot.SnapshotID][processID]; duplicate {
+				fail(fmt.Sprintf("%s: repeated snapshot %d", snapshotPath, snapshot.SnapshotID))
 			}
-			all[s.SnapshotID][p] = s
+			snapshotsByID[snapshot.SnapshotID][processID] = snapshot
 		}
-		if e := scanner.Err(); e != nil {
-			fail(e.Error())
+		if err := scanner.Err(); err != nil {
+			fail(err.Error())
 		}
-		f.Close()
+		snapshotFile.Close()
 	}
+
 	checks := []struct {
 		name    string
-		valid   func(global) bool
-		reasons invariant
+		valid   func(globalSnapshot) bool
+		reasons invariantReasons
 	}{
 		{"INV1 at most one inMX", Inv1, inv1},
 		{"INV2 all noMX implies no pending protocol", Inv2, inv2},
@@ -73,183 +81,199 @@ func main() {
 		{"INV5 only a process with priority may defer", Inv5, inv5},
 		{"INV6 inMX received all replies", Inv6, inv6},
 	}
-	good, missing := 0, 0
+	completeCount, incompleteCount := 0, 0
 	var violations []violation
-	ids := make([]int, 0, len(all))
-	for id := range all {
-		ids = append(ids, id)
+	snapshotIDs := make([]int, 0, len(snapshotsByID))
+	for snapshotID := range snapshotsByID {
+		snapshotIDs = append(snapshotIDs, snapshotID)
 	}
-	sort.Ints(ids)
-	for _, id := range ids {
-		s := all[id]
-		if len(s) != *n {
-			missing++
+	sort.Ints(snapshotIDs)
+	for _, snapshotID := range snapshotIDs {
+		globalState := snapshotsByID[snapshotID]
+		if len(globalState) != *processCount {
+			incompleteCount++
 			continue
 		}
-		good++
-		for _, c := range checks {
-			if !c.valid(s) {
-				for _, reason := range c.reasons(s) {
-					violations = append(violations, violation{id, c.name, reason})
+		completeCount++
+		for _, check := range checks {
+			if !check.valid(globalState) {
+				for _, reason := range check.reasons(globalState) {
+					violations = append(violations, violation{snapshotID, check.name, reason})
 				}
 			}
 		}
 	}
-	for i, v := range violations {
-		if i < 20 {
-			fmt.Printf("snapshot %d: %s: %s\n", v.Snapshot, v.Name, v.Detail)
+	for index, item := range violations {
+		if index < 20 {
+			fmt.Printf("snapshot %d: %s: %s\n", item.SnapshotID, item.Name, item.Detail)
 		}
 	}
 	if len(violations) > 20 {
 		fmt.Printf("... %d more violations\n", len(violations)-20)
 	}
-	fmt.Printf("complete snapshots=%d, incomplete=%d, invariant violations=%d\n", good, missing, len(violations))
-	b, e := os.ReadFile(*file)
-	if e != nil {
-		fail(e.Error())
+	fmt.Printf("complete snapshots=%d, incomplete=%d, invariant violations=%d\n",
+		completeCount, incompleteCount, len(violations))
+
+	output, err := os.ReadFile(*outputPath)
+	if err != nil {
+		fail(err.Error())
 	}
-	malformed := 0
-	for i, c := range b {
-		if (i%2 == 0 && c != '|') || (i%2 == 1 && c != '.') {
-			malformed++
+	invalidPositions := 0
+	for index, character := range output {
+		if (index%2 == 0 && character != '|') || (index%2 == 1 && character != '.') {
+			invalidPositions++
 		}
 	}
-	doubleBars := strings.Count(string(b), "||")
-	doubleDots := strings.Count(string(b), "..")
-	// A process interrupted with Ctrl+C inside the critical section leaves a final
-	// "|" with no matching "."; that is an unfinished access, not a mutual
-	// exclusion violation, so it does not fail the check.
-	unfinished := len(b)%2 != 0 && b[len(b)-1] == '|'
-	fmt.Printf("shared file: %d bytes, %d two-byte positions, ||= %d, ..= %d, invalid positions=%d\n", len(b), len(b)/2, doubleBars, doubleDots, malformed)
-	if unfinished {
+	doubleBars := strings.Count(string(output), "||")
+	doubleDots := strings.Count(string(output), "..")
+	// Ctrl+C durante a seção crítica pode deixar apenas o último "|".
+	unfinishedAccess := len(output)%2 != 0 && output[len(output)-1] == '|'
+	fmt.Printf("shared file: %d bytes, %d two-byte positions, ||= %d, ..= %d, invalid positions=%d\n",
+		len(output), len(output)/2, doubleBars, doubleDots, invalidPositions)
+	if unfinishedAccess {
 		fmt.Println("note: the file ends with an unfinished access (a process was interrupted inside the critical section)")
 	}
-	if len(violations) > 0 || good < *min || missing > 0 || malformed > 0 || (len(b)%2 != 0 && !unfinished) {
+	if len(violations) > 0 || completeCount < *minSnapshots || incompleteCount > 0 ||
+		invalidPositions > 0 || (len(output)%2 != 0 && !unfinishedAccess) {
 		os.Exit(1)
 	}
 }
-func fail(s string) { fmt.Fprintln(os.Stderr, s); os.Exit(2) }
 
-// Each InvX is a boolean predicate over a complete global snapshot.
-// The lower-case companions provide a reason when a predicate fails.
-func Inv1(s global) bool { return len(inv1(s)) == 0 }
-func Inv2(s global) bool { return len(inv2(s)) == 0 }
-func Inv3(s global) bool { return len(inv3(s)) == 0 }
-func Inv4(s global) bool { return len(inv4(s)) == 0 }
-func Inv5(s global) bool { return len(inv5(s)) == 0 }
-func Inv6(s global) bool { return len(inv6(s)) == 0 }
-func inv1(s global) []string {
-	count := 0
-	for _, p := range s {
-		if p.Local.State == DIMEX.InMX {
-			count++
+func fail(message string) {
+	fmt.Fprintln(os.Stderr, message)
+	os.Exit(2)
+}
+
+func Inv1(snapshot globalSnapshot) bool { return len(inv1(snapshot)) == 0 }
+func Inv2(snapshot globalSnapshot) bool { return len(inv2(snapshot)) == 0 }
+func Inv3(snapshot globalSnapshot) bool { return len(inv3(snapshot)) == 0 }
+func Inv4(snapshot globalSnapshot) bool { return len(inv4(snapshot)) == 0 }
+func Inv5(snapshot globalSnapshot) bool { return len(inv5(snapshot)) == 0 }
+func Inv6(snapshot globalSnapshot) bool { return len(inv6(snapshot)) == 0 }
+
+// INV1: só um processo pode estar na seção crítica.
+func inv1(snapshot globalSnapshot) []string {
+	inCriticalSection := 0
+	for _, process := range snapshot {
+		if process.Local.State == DIMEX.InMX {
+			inCriticalSection++
 		}
 	}
-	if count > 1 {
-		return []string{fmt.Sprintf("%d processes inMX", count)}
+	if inCriticalSection > 1 {
+		return []string{fmt.Sprintf("%d processes inMX", inCriticalSection)}
 	}
 	return nil
 }
-func inv2(s global) []string {
-	for _, p := range s {
-		if p.Local.State != DIMEX.NoMX {
+
+// INV2: se todos estão livres, não deve haver trabalho de protocolo pendente.
+func inv2(snapshot globalSnapshot) []string {
+	for _, process := range snapshot {
+		if process.Local.State != DIMEX.NoMX {
 			return nil
 		}
 	}
-	for id, p := range s {
-		for q, ts := range p.Local.Waiting {
-			if ts != 0 {
-				return []string{fmt.Sprintf("p%d waiting for p%d", id, q)}
+	for processID, process := range snapshot {
+		for requesterID, timestamp := range process.Local.Waiting {
+			if timestamp != 0 {
+				return []string{fmt.Sprintf("p%d waiting for p%d", processID, requesterID)}
 			}
 		}
-		for q, msgs := range p.Channels {
-			if len(msgs) > 0 {
-				return []string{fmt.Sprintf("%d messages on %d -> %d", len(msgs), q, id)}
+		for senderID, messages := range process.Channels {
+			if len(messages) > 0 {
+				return []string{fmt.Sprintf("%d messages on %d -> %d", len(messages), senderID, processID)}
 			}
 		}
 	}
 	return nil
 }
-func inv3(s global) []string {
-	var out []string
-	for q, receiver := range s {
-		for p, ts := range receiver.Local.Waiting {
-			if ts != 0 && (s[p].Local.State == DIMEX.NoMX || s[p].Local.RequestTS != ts) {
-				out = append(out, fmt.Sprintf("p%d waiting[%d]=%d, requester state=%s ts=%d", q, p, ts, s[p].Local.State, s[p].Local.RequestTS))
+
+// INV3: uma resposta adiada precisa pertencer ao pedido atual de quem a aguarda.
+func inv3(snapshot globalSnapshot) []string {
+	var reasons []string
+	for receiverID, receiver := range snapshot {
+		for requesterID, timestamp := range receiver.Local.Waiting {
+			requester := snapshot[requesterID]
+			if timestamp != 0 && (requester.Local.State == DIMEX.NoMX || requester.Local.RequestTS != timestamp) {
+				reasons = append(reasons, fmt.Sprintf("p%d waiting[%d]=%d, requester state=%s ts=%d",
+					receiverID, requesterID, timestamp, requester.Local.State, requester.Local.RequestTS))
 			}
 		}
 	}
-	return out
+	return reasons
 }
-func inv4(s global) []string {
-	var out []string
-	for p, requester := range s {
+
+// INV4: para cada par, o pedido deve estar em exatamente uma etapa do caminho.
+func inv4(snapshot globalSnapshot) []string {
+	var reasons []string
+	for requesterID, requester := range snapshot {
 		if requester.Local.State != DIMEX.WantMX {
 			continue
 		}
-		for q, other := range s {
-			if q == p {
+		for peerID, peer := range snapshot {
+			if peerID == requesterID {
 				continue
 			}
-			total := 0
-			if requester.Local.Responses[q] {
-				total++
+			positions := 0
+			if requester.Local.Responses[peerID] {
+				positions++
 			}
-			if other.Local.Waiting[p] == requester.Local.RequestTS {
-				total++
+			if peer.Local.Waiting[requesterID] == requester.Local.RequestTS {
+				positions++
 			}
-			for _, m := range requester.Channels[q] {
-				if m.Type == "RESP_OK" && m.ReqTS == requester.Local.RequestTS {
-					total++
+			for _, message := range requester.Channels[peerID] {
+				if message.Type == "RESP_OK" && message.ReqTS == requester.Local.RequestTS {
+					positions++
 				}
 			}
-			for _, m := range other.Channels[p] {
-				if m.Type == "REQ_ENTRY" && m.ReqTS == requester.Local.RequestTS {
-					total++
+			for _, message := range peer.Channels[requesterID] {
+				if message.Type == "REQ_ENTRY" && message.ReqTS == requester.Local.RequestTS {
+					positions++
 				}
 			}
-			if total != 1 {
-				out = append(out, fmt.Sprintf("request p%d from p%d accounted %d times (expected 1)", p, q, total))
+			if positions != 1 {
+				reasons = append(reasons, fmt.Sprintf("request p%d from p%d accounted %d times (expected 1)",
+					requesterID, peerID, positions))
 			}
 		}
 	}
-	return out
+	return reasons
 }
 
-// A process may only defer a reply to q while it is inside the critical section,
-// or while it wants it and its own request has priority over q's. This is the
-// reply condition of the algorithm stated as an assertion, so it also covers the
-// case of a noMX process deferring.
-func inv5(s global) []string {
-	var out []string
-	for p, proc := range s {
-		for q, ts := range proc.Local.Waiting {
-			if ts == 0 || proc.Local.State == DIMEX.InMX {
+// INV5: só adia a resposta quem já entrou ou possui um pedido com prioridade.
+func inv5(snapshot globalSnapshot) []string {
+	var reasons []string
+	for processID, process := range snapshot {
+		for requesterID, timestamp := range process.Local.Waiting {
+			if timestamp == 0 || process.Local.State == DIMEX.InMX {
 				continue
 			}
-			if proc.Local.State == DIMEX.WantMX && before(p, proc.Local.RequestTS, q, ts) {
+			if process.Local.State == DIMEX.WantMX &&
+				before(processID, process.Local.RequestTS, requesterID, timestamp) {
 				continue
 			}
-			out = append(out, fmt.Sprintf("p%d (%s, ts=%d) deferred p%d (ts=%d) without priority",
-				p, proc.Local.State, proc.Local.RequestTS, q, ts))
+			reasons = append(reasons, fmt.Sprintf("p%d (%s, ts=%d) deferred p%d (ts=%d) without priority",
+				processID, process.Local.State, process.Local.RequestTS, requesterID, timestamp))
 		}
 	}
-	return out
+	return reasons
 }
 
-// Same total order the DIMEX module uses to decide who goes first.
-func before(id1, ts1, id2, ts2 int) bool { return ts1 < ts2 || (ts1 == ts2 && id1 < id2) }
+// Mesma ordem total usada pelo módulo DiMEx.
+func before(firstID, firstTimestamp, secondID, secondTimestamp int) bool {
+	return firstTimestamp < secondTimestamp || (firstTimestamp == secondTimestamp && firstID < secondID)
+}
 
-func inv6(s global) []string {
-	var out []string
-	for p, proc := range s {
-		if proc.Local.State == DIMEX.InMX {
-			for q := range s {
-				if p != q && !proc.Local.Responses[q] {
-					out = append(out, fmt.Sprintf("p%d inMX without p%d reply", p, q))
+// INV6: quem já entrou recebeu a autorização de todos os outros processos.
+func inv6(snapshot globalSnapshot) []string {
+	var reasons []string
+	for processID, process := range snapshot {
+		if process.Local.State == DIMEX.InMX {
+			for peerID := range snapshot {
+				if processID != peerID && !process.Local.Responses[peerID] {
+					reasons = append(reasons, fmt.Sprintf("p%d inMX without p%d reply", processID, peerID))
 				}
 			}
 		}
 	}
-	return out
+	return reasons
 }

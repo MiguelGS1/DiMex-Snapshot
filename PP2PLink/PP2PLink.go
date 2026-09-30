@@ -1,6 +1,4 @@
-// Package PP2PLink provides FIFO reliable delivery over TCP.
-// Each destination has a serial sender. ACKs and sequence numbers allow
-// reconnection without duplicate delivery. Peers must eventually be available.
+// Package PP2PLink entrega mensagens em ordem FIFO entre processos via TCP.
 package PP2PLink
 
 import (
@@ -23,6 +21,8 @@ type IndMessage struct {
 	From    int
 	Message string
 }
+
+// Os campos do pacote também definem o formato JSON enviado pela conexão.
 type packet struct {
 	From    int
 	Seq     uint64
@@ -31,159 +31,166 @@ type packet struct {
 type ack struct{ Seq uint64 }
 
 type PP2PLink struct {
-	Req       chan ReqMessage
-	Ind       chan IndMessage
-	id        int
-	addresses []string
-	queues    []chan string
-	mu        sync.Mutex
-	last      []uint64
-	listener  net.Listener
+	Req              chan ReqMessage
+	Ind              chan IndMessage
+	processID        int
+	addresses        []string
+	outboundQueues   []chan string
+	receiveMu        sync.Mutex
+	lastDeliveredSeq []uint64
+	listener         net.Listener
 }
 
-func NewPP2PLink(addresses []string, id int) (*PP2PLink, error) {
-	if id < 0 || id >= len(addresses) || len(addresses) == 0 {
-		return nil, fmt.Errorf("invalid process ID %d", id)
+func NewPP2PLink(addresses []string, processID int) (*PP2PLink, error) {
+	if processID < 0 || processID >= len(addresses) || len(addresses) == 0 {
+		return nil, fmt.Errorf("invalid process ID %d", processID)
 	}
-	l, err := net.Listen("tcp", addresses[id])
+	listener, err := net.Listen("tcp", addresses[processID])
 	if err != nil {
 		return nil, err
 	}
-	p := &PP2PLink{
-		Req:       make(chan ReqMessage, 4096),
-		Ind:       make(chan IndMessage),
-		id:        id,
-		addresses: addresses,
-		queues:    make([]chan string, len(addresses)),
-		last:      make([]uint64, len(addresses)),
-		listener:  l,
+	link := &PP2PLink{
+		Req:              make(chan ReqMessage, 4096),
+		Ind:              make(chan IndMessage),
+		processID:        processID,
+		addresses:        addresses,
+		outboundQueues:   make([]chan string, len(addresses)),
+		lastDeliveredSeq: make([]uint64, len(addresses)),
+		listener:         listener,
 	}
-	for i := range addresses {
-		if i != id {
-			p.queues[i] = make(chan string, 4096)
-			go p.sender(i)
+	for peerID := range addresses {
+		if peerID != processID {
+			link.outboundQueues[peerID] = make(chan string, 4096)
+			go link.sender(peerID)
 		}
 	}
-	go p.dispatch()
-	go p.accept()
-	return p, nil
+	go link.dispatch()
+	go link.accept()
+	return link, nil
 }
 
-func (p *PP2PLink) dispatch() {
-	for msg := range p.Req {
-		if msg.To != p.id && msg.To >= 0 && msg.To < len(p.queues) {
-			p.queues[msg.To] <- msg.Message
+// Cada destino tem uma fila e uma goroutine de envio, mantendo a ordem das mensagens.
+func (link *PP2PLink) dispatch() {
+	for request := range link.Req {
+		if request.To != link.processID && request.To >= 0 && request.To < len(link.outboundQueues) {
+			link.outboundQueues[request.To] <- request.Message
 		}
 	}
 }
 
-func (p *PP2PLink) sender(dest int) {
-	var conn net.Conn
-	var seq uint64
-	for msg := range p.queues[dest] {
-		pkt := packet{From: p.id, Seq: seq + 1, Message: msg}
+func (link *PP2PLink) sender(destinationID int) {
+	var connection net.Conn
+	var lastConfirmedSeq uint64
+	for payload := range link.outboundQueues[destinationID] {
+		outgoing := packet{From: link.processID, Seq: lastConfirmedSeq + 1, Message: payload}
 		for {
-			if conn == nil {
+			if connection == nil {
 				var err error
-				conn, err = net.DialTimeout("tcp", p.addresses[dest], time.Second)
+				connection, err = net.DialTimeout("tcp", link.addresses[destinationID], time.Second)
 				if err != nil {
 					time.Sleep(30 * time.Millisecond)
 					continue
 				}
 			}
-			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-			var a ack
-			if err := writeFrame(conn, pkt); err == nil {
-				err = readFrame(conn, &a)
-				if err == nil && a.Seq == pkt.Seq {
-					seq++
+			_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+			var confirmation ack
+			if err := writeFrame(connection, outgoing); err == nil {
+				err = readFrame(connection, &confirmation)
+				if err == nil && confirmation.Seq == outgoing.Seq {
+					lastConfirmedSeq++
 					break
 				}
 			}
-			_ = conn.Close()
-			conn = nil
+			// A mesma sequência é reenviada se a conexão ou a confirmação falhar.
+			_ = connection.Close()
+			connection = nil
 			time.Sleep(30 * time.Millisecond)
 		}
 	}
 }
 
-func (p *PP2PLink) accept() {
+func (link *PP2PLink) accept() {
 	for {
-		c, err := p.listener.Accept()
+		connection, err := link.listener.Accept()
 		if err != nil {
 			log.Printf("PL accept: %v", err)
 			return
 		}
-		go p.receive(c)
+		go link.receive(connection)
 	}
 }
 
-func (p *PP2PLink) receive(c net.Conn) {
-	defer c.Close()
+func (link *PP2PLink) receive(connection net.Conn) {
+	defer connection.Close()
 	for {
-		_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-		var m packet
-		if err := readFrame(c, &m); err != nil {
+		_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+		var incoming packet
+		if err := readFrame(connection, &incoming); err != nil {
 			return
 		}
-		if m.From < 0 || m.From >= len(p.addresses) || m.From == p.id {
+		if incoming.From < 0 || incoming.From >= len(link.addresses) || incoming.From == link.processID {
 			return
 		}
-		p.mu.Lock()
-		if m.Seq == p.last[m.From]+1 {
-			p.Ind <- IndMessage{From: m.From, Message: m.Message}
-			p.last[m.From] = m.Seq
-		} else if m.Seq != p.last[m.From] {
-			p.mu.Unlock()
+		link.receiveMu.Lock()
+		lastSequence := link.lastDeliveredSeq[incoming.From]
+		if incoming.Seq == lastSequence+1 {
+			link.Ind <- IndMessage{From: incoming.From, Message: incoming.Message}
+			link.lastDeliveredSeq[incoming.From] = incoming.Seq
+		} else if incoming.Seq != lastSequence {
+			link.receiveMu.Unlock()
 			return
 		}
-		p.mu.Unlock()
-		if err := writeFrame(c, ack{Seq: m.Seq}); err != nil {
+		// Uma retransmissão já entregue recebe ACK, mas não chega duas vezes ao DiMEx.
+		link.receiveMu.Unlock()
+		if err := writeFrame(connection, ack{Seq: incoming.Seq}); err != nil {
 			return
 		}
 	}
 }
 
-func writeFrame(w io.Writer, v interface{}) error {
-	b, e := json.Marshal(v)
-	if e != nil {
-		return e
+// O tamanho no cabeçalho permite ler exatamente um JSON por mensagem TCP.
+func writeFrame(writer io.Writer, value interface{}) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
 	}
-	if len(b) > 65536 {
+	if len(encoded) > 65536 {
 		return errors.New("frame too large")
 	}
 	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(b)))
-	if e = writeAll(w, header[:]); e != nil {
-		return e
+	binary.BigEndian.PutUint32(header[:], uint32(len(encoded)))
+	if err = writeAll(writer, header[:]); err != nil {
+		return err
 	}
-	return writeAll(w, b)
+	return writeAll(writer, encoded)
 }
-func writeAll(w io.Writer, b []byte) error {
-	for len(b) > 0 {
-		n, e := w.Write(b)
-		if e != nil {
-			return e
+
+func writeAll(writer io.Writer, remaining []byte) error {
+	for len(remaining) > 0 {
+		written, err := writer.Write(remaining)
+		if err != nil {
+			return err
 		}
-		if n == 0 {
+		if written == 0 {
 			return io.ErrShortWrite
 		}
-		b = b[n:]
+		remaining = remaining[written:]
 	}
 	return nil
 }
-func readFrame(r io.Reader, v interface{}) error {
+
+func readFrame(reader io.Reader, destination interface{}) error {
 	var header [4]byte
-	if _, e := io.ReadFull(r, header[:]); e != nil {
-		return e
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return err
 	}
-	n := binary.BigEndian.Uint32(header[:])
-	if n == 0 || n > 65536 {
+	frameSize := binary.BigEndian.Uint32(header[:])
+	if frameSize == 0 || frameSize > 65536 {
 		return errors.New("invalid frame size")
 	}
-	b := make([]byte, n)
-	if _, e := io.ReadFull(r, b); e != nil {
-		return e
+	encoded := make([]byte, frameSize)
+	if _, err := io.ReadFull(reader, encoded); err != nil {
+		return err
 	}
-	return json.Unmarshal(b, v)
+	return json.Unmarshal(encoded, destination)
 }

@@ -15,7 +15,7 @@ git clone https://github.com/MiguelGS1/DiMex-Snapshot.git
 cd DiMex-Snapshot
 ```
 
-Se o projeto já estiver aberto no VS Code, basta abrir o terminal na pasta que contém o arquivo `go.mod`. Execute os comandos abaixo **um de cada vez**:
+Se você recebeu o ZIP, descompacte-o e abra a pasta `DiMeX-Entrega` no VS Code. Em qualquer caso, use o terminal na pasta que contém `go.mod` e execute os comandos abaixo **um de cada vez**:
 
 ```bash
 bash scripts/demo.sh normal
@@ -27,7 +27,7 @@ Cada comando compila o programa, inicia três processos e coleta 250 snapshots:
 
 - `normal`: execução sem falhas; espera-se 250 snapshots completos e nenhuma violação de invariantes.
 - `unsafe`: simula uma falha de exclusão mútua; o verificador deve identificar a violação `INV1`.
-- `block`: simula bloqueio dos processos; o verificador deve identificar a violação `INV6`.
+- `block`: simula bloqueio dos processos; o verificador deve identificar a violação `INV5` (respostas adiadas sem prioridade).
 
 Os resultados são gravados em `runs/normal/`, `runs/unsafe/` e `runs/block/`. Para conferir a quantidade de snapshots da execução normal:
 
@@ -44,6 +44,8 @@ segundos. Para rodar como no template da professora — um processo por terminal
 usuário interromper — use `--duration=0`, que faz cada processo rodar até o `Ctrl+C`:
 
 ```bash
+mkdir -p bin snapshots
+: > mxOUT.txt
 go build -o bin/dimex ./cmd/dimex
 bin/dimex --duration=0 --snapshots=snapshots --file=mxOUT.txt 0 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002
 bin/dimex --duration=0 --snapshots=snapshots --file=mxOUT.txt 1 127.0.0.1:5000 127.0.0.1:5001 127.0.0.1:5002

@@ -1,5 +1,5 @@
-// Package DIMEX implements Ricart-Agrawala and Chandy-Lamport snapshots.
-// A single event loop serializes local events and received messages.
+// Package DIMEX implementa exclusão mútua por Ricart–Agrawala e snapshots de Chandy–Lamport.
+// Um único laço processa pedidos locais, mensagens recebidas e marcadores.
 package DIMEX
 
 import (
@@ -18,14 +18,16 @@ const (
 	InMX   State = "inMX"
 )
 
-type dmxReq int
+type requestKind int
 
 const (
-	ENTER dmxReq = iota
+	ENTER requestKind = iota
 	EXIT
 )
 
-type dmxResp struct{}
+type accessGranted struct{}
+
+// Os campos de Message, LocalState e Snapshot fazem parte do JSON dos snapshots.
 type Message struct {
 	Type       string
 	From       int
@@ -47,232 +49,254 @@ type Snapshot struct {
 	Channels   map[int][]Message
 	closed     map[int]bool
 }
+
 type DIMEX_Module struct {
-	Req         chan dmxReq
-	Ind         chan dmxResp
-	SnapshotReq chan int
-	Pp2plink    *PP2PLink.PP2PLink
-	id, n       int
-	st          State
-	lcl, reqTs  int
-	responses   []bool
-	waiting     []int
-	active      map[int]*Snapshot
-	file        *os.File
-	fault       string
+	Req              chan requestKind
+	Ind              chan accessGranted
+	SnapshotReq      chan int
+	Pp2plink         *PP2PLink.PP2PLink
+	processID        int
+	processCount     int
+	state            State
+	logicalClock     int
+	requestTimestamp int
+	repliesReceived  []bool
+	deferredRequests []int
+	activeSnapshots  map[int]*Snapshot
+	snapshotFile     *os.File
+	faultMode        string
 }
 
-func NewDIMEX(addresses []string, id int, snapshotDir, fault string) (*DIMEX_Module, error) {
-	if fault != "" && fault != "unsafe" && fault != "block" {
-		return nil, fmt.Errorf("unknown fault %q", fault)
+func NewDIMEX(addresses []string, processID int, snapshotDir, faultMode string) (*DIMEX_Module, error) {
+	if faultMode != "" && faultMode != "unsafe" && faultMode != "block" {
+		return nil, fmt.Errorf("unknown fault %q", faultMode)
 	}
-	if id < 0 || id >= len(addresses) {
-		return nil, fmt.Errorf("invalid ID %d", id)
+	if processID < 0 || processID >= len(addresses) {
+		return nil, fmt.Errorf("invalid ID %d", processID)
 	}
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(snapshotDir, fmt.Sprintf("process_%d.jsonl", id))
-	f, e := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-	if e != nil {
-		return nil, e
+	snapshotPath := filepath.Join(snapshotDir, fmt.Sprintf("process_%d.jsonl", processID))
+	snapshotFile, err := os.OpenFile(snapshotPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
 	}
-	pl, e := PP2PLink.NewPP2PLink(addresses, id)
-	if e != nil {
-		f.Close()
-		return nil, e
+	link, err := PP2PLink.NewPP2PLink(addresses, processID)
+	if err != nil {
+		snapshotFile.Close()
+		return nil, err
 	}
-	m := &DIMEX_Module{
-		Req:         make(chan dmxReq, 1),
-		Ind:         make(chan dmxResp, 1),
-		SnapshotReq: make(chan int, 1024),
-		Pp2plink:    pl,
-		id:          id,
-		n:           len(addresses),
-		st:          NoMX,
-		responses:   make([]bool, len(addresses)),
-		waiting:     make([]int, len(addresses)),
-		active:      make(map[int]*Snapshot),
-		file:        f,
-		fault:       fault,
+	module := &DIMEX_Module{
+		Req:              make(chan requestKind, 1),
+		Ind:              make(chan accessGranted, 1),
+		SnapshotReq:      make(chan int, 1024),
+		Pp2plink:         link,
+		processID:        processID,
+		processCount:     len(addresses),
+		state:            NoMX,
+		repliesReceived:  make([]bool, len(addresses)),
+		deferredRequests: make([]int, len(addresses)),
+		activeSnapshots:  make(map[int]*Snapshot),
+		snapshotFile:     snapshotFile,
+		faultMode:        faultMode,
 	}
-	go m.run()
-	return m, nil
+	go module.run()
+	return module, nil
 }
 
-func (m *DIMEX_Module) send(to int, msg Message) {
-	msg.Clock = m.lcl
-	b, _ := json.Marshal(msg)
-	m.Pp2plink.Req <- PP2PLink.ReqMessage{To: to, Message: string(b)}
-}
-func before(id1, ts1, id2, ts2 int) bool { return ts1 < ts2 || (ts1 == ts2 && id1 < id2) }
-func (m *DIMEX_Module) reply(to, ts int) {
-	m.lcl++
-	m.send(to, Message{Type: "RESP_OK", From: m.id, ReqTS: ts})
+func (module *DIMEX_Module) send(destinationID int, message Message) {
+	message.Clock = module.logicalClock
+	encoded, _ := json.Marshal(message)
+	module.Pp2plink.Req <- PP2PLink.ReqMessage{To: destinationID, Message: string(encoded)}
 }
 
-func (m *DIMEX_Module) run() {
+// O menor par (timestamp lógico, ID) tem prioridade.
+func before(firstID, firstTimestamp, secondID, secondTimestamp int) bool {
+	return firstTimestamp < secondTimestamp || (firstTimestamp == secondTimestamp && firstID < secondID)
+}
+
+func (module *DIMEX_Module) reply(destinationID, requestTimestamp int) {
+	module.logicalClock++
+	module.send(destinationID, Message{Type: "RESP_OK", From: module.processID, ReqTS: requestTimestamp})
+}
+
+func (module *DIMEX_Module) run() {
 	for {
 		select {
-		case req := <-m.Req:
-			if req == ENTER {
-				m.entry()
+		case request := <-module.Req:
+			if request == ENTER {
+				module.entry()
 			} else {
-				m.exit()
+				module.exit()
 			}
-		case id := <-m.SnapshotReq:
-			if id > 0 {
-				m.startSnapshot(id, -1)
+		case snapshotID := <-module.SnapshotReq:
+			if snapshotID > 0 {
+				module.startSnapshot(snapshotID, -1)
 			}
-		case ind := <-m.Pp2plink.Ind:
-			var msg Message
-			if err := json.Unmarshal([]byte(ind.Message), &msg); err != nil || msg.From != ind.From {
+		case delivery := <-module.Pp2plink.Ind:
+			var message Message
+			if err := json.Unmarshal([]byte(delivery.Message), &message); err != nil || message.From != delivery.From {
 				continue
 			}
-			if msg.Type == "MARKER" {
-				m.marker(msg.SnapshotID, ind.From)
+			if message.Type == "MARKER" {
+				module.marker(message.SnapshotID, delivery.From)
 				continue
 			}
-			for _, s := range m.active {
-				if !s.closed[ind.From] {
-					s.Channels[ind.From] = append(s.Channels[ind.From], msg)
+			// Até chegar o marcador desse remetente, a mensagem pertence ao canal do snapshot.
+			for _, snapshot := range module.activeSnapshots {
+				if !snapshot.closed[delivery.From] {
+					snapshot.Channels[delivery.From] = append(snapshot.Channels[delivery.From], message)
 				}
 			}
-			if msg.Type == "REQ_ENTRY" {
-				m.onRequest(msg)
-			} else if msg.Type == "RESP_OK" {
-				m.onReply(msg)
+			if message.Type == "REQ_ENTRY" {
+				module.onRequest(message)
+			} else if message.Type == "RESP_OK" {
+				module.onReply(message)
 			}
 		}
 	}
 }
 
-func (m *DIMEX_Module) entry() {
-	if m.st != NoMX {
+func (module *DIMEX_Module) entry() {
+	if module.state != NoMX {
 		panic("ENTRY outside noMX")
 	}
-	m.lcl++
-	m.reqTs = m.lcl
-	m.st = WantMX
-	for i := range m.responses {
-		m.responses[i] = false
+	module.logicalClock++
+	module.requestTimestamp = module.logicalClock
+	module.state = WantMX
+	for peerID := range module.repliesReceived {
+		module.repliesReceived[peerID] = false
 	}
-	for i := 0; i < m.n; i++ {
-		if i != m.id {
-			m.send(i, Message{Type: "REQ_ENTRY", From: m.id, ReqTS: m.reqTs})
+	for peerID := 0; peerID < module.processCount; peerID++ {
+		if peerID != module.processID {
+			module.send(peerID, Message{Type: "REQ_ENTRY", From: module.processID, ReqTS: module.requestTimestamp})
 		}
 	}
-	if m.n == 1 {
-		m.st = InMX
-		m.Ind <- dmxResp{}
+	// Sem outros processos, não há respostas a aguardar.
+	if module.processCount == 1 {
+		module.state = InMX
+		module.Ind <- accessGranted{}
 	}
 }
-func (m *DIMEX_Module) exit() {
-	if m.st != InMX {
+
+func (module *DIMEX_Module) exit() {
+	if module.state != InMX {
 		panic("EXIT outside inMX")
 	}
-	m.st = NoMX
-	for i, ts := range m.waiting {
-		if ts != 0 {
-			m.waiting[i] = 0
-			m.reply(i, ts)
+	module.state = NoMX
+	for peerID, timestamp := range module.deferredRequests {
+		if timestamp != 0 {
+			module.deferredRequests[peerID] = 0
+			module.reply(peerID, timestamp)
 		}
 	}
 }
-func (m *DIMEX_Module) onRequest(msg Message) {
-	if msg.ReqTS <= 0 || msg.From < 0 || msg.From >= m.n || msg.From == m.id {
+
+func (module *DIMEX_Module) onRequest(message Message) {
+	if message.ReqTS <= 0 || message.From < 0 || message.From >= module.processCount || message.From == module.processID {
 		return
 	}
-	if m.lcl < msg.ReqTS {
-		m.lcl = msg.ReqTS
+	if module.logicalClock < message.ReqTS {
+		module.logicalClock = message.ReqTS
 	}
-	m.lcl++
-	deferReply := m.st == InMX || (m.st == WantMX && before(m.id, m.reqTs, msg.From, msg.ReqTS))
-	if m.fault == "unsafe" {
+	module.logicalClock++
+	deferReply := module.state == InMX ||
+		(module.state == WantMX && before(module.processID, module.requestTimestamp, message.From, message.ReqTS))
+	// As falhas mudam apenas a decisão de responder, para testar as invariantes.
+	if module.faultMode == "unsafe" {
 		deferReply = false
 	}
-	if m.fault == "block" {
+	if module.faultMode == "block" {
 		deferReply = true
 	}
 	if deferReply {
-		m.waiting[msg.From] = msg.ReqTS
+		module.deferredRequests[message.From] = message.ReqTS
 	} else {
-		m.reply(msg.From, msg.ReqTS)
+		module.reply(message.From, message.ReqTS)
 	}
 }
-func (m *DIMEX_Module) onReply(msg Message) {
-	if m.lcl < msg.Clock {
-		m.lcl = msg.Clock
+
+func (module *DIMEX_Module) onReply(message Message) {
+	if module.logicalClock < message.Clock {
+		module.logicalClock = message.Clock
 	}
-	m.lcl++
-	if m.st != WantMX || msg.ReqTS != m.reqTs || msg.From == m.id || m.responses[msg.From] {
+	module.logicalClock++
+	if module.state != WantMX || message.ReqTS != module.requestTimestamp ||
+		message.From == module.processID || module.repliesReceived[message.From] {
 		return
 	}
-	m.responses[msg.From] = true
-	for i := 0; i < m.n; i++ {
-		if i != m.id && !m.responses[i] {
+	module.repliesReceived[message.From] = true
+	for peerID := 0; peerID < module.processCount; peerID++ {
+		if peerID != module.processID && !module.repliesReceived[peerID] {
 			return
 		}
 	}
-	m.st = InMX
-	m.Ind <- dmxResp{}
+	// Ind só libera a aplicação após a resposta de todos os outros processos.
+	module.state = InMX
+	module.Ind <- accessGranted{}
 }
-func (m *DIMEX_Module) startSnapshot(id, firstFrom int) {
-	if _, exists := m.active[id]; exists {
+
+func (module *DIMEX_Module) startSnapshot(snapshotID, firstMarkerFrom int) {
+	if _, exists := module.activeSnapshots[snapshotID]; exists {
 		return
 	}
-	s := &Snapshot{
-		SnapshotID: id,
-		ProcessID:  m.id,
+	snapshot := &Snapshot{
+		SnapshotID: snapshotID,
+		ProcessID:  module.processID,
 		Local: LocalState{
-			State:     m.st,
-			Clock:     m.lcl,
-			RequestTS: m.reqTs,
-			Responses: append([]bool(nil), m.responses...),
-			Waiting:   append([]int(nil), m.waiting...),
+			State:     module.state,
+			Clock:     module.logicalClock,
+			RequestTS: module.requestTimestamp,
+			Responses: append([]bool(nil), module.repliesReceived...),
+			Waiting:   append([]int(nil), module.deferredRequests...),
 		},
 		Channels: make(map[int][]Message),
 		closed:   make(map[int]bool),
 	}
-	m.active[id] = s
-	for i := 0; i < m.n; i++ {
-		if i != m.id {
-			s.Channels[i] = []Message{}
-			s.closed[i] = i == firstFrom
+	module.activeSnapshots[snapshotID] = snapshot
+	for peerID := 0; peerID < module.processCount; peerID++ {
+		if peerID != module.processID {
+			snapshot.Channels[peerID] = []Message{}
+			snapshot.closed[peerID] = peerID == firstMarkerFrom
 		}
 	}
-	for i := 0; i < m.n; i++ {
-		if i != m.id {
-			m.send(i, Message{Type: "MARKER", From: m.id, SnapshotID: id})
+	// Os marcadores usam a mesma fila FIFO das mensagens normais para cada destino.
+	for peerID := 0; peerID < module.processCount; peerID++ {
+		if peerID != module.processID {
+			module.send(peerID, Message{Type: "MARKER", From: module.processID, SnapshotID: snapshotID})
 		}
 	}
-	m.finishIfComplete(id)
+	module.finishIfComplete(snapshotID)
 }
-func (m *DIMEX_Module) marker(id, from int) {
-	if id <= 0 || from == m.id {
+
+func (module *DIMEX_Module) marker(snapshotID, senderID int) {
+	if snapshotID <= 0 || senderID == module.processID {
 		return
 	}
-	if _, ok := m.active[id]; !ok {
-		m.startSnapshot(id, from)
+	if _, exists := module.activeSnapshots[snapshotID]; !exists {
+		// O primeiro marcador registra o estado local e fecha o canal de origem.
+		module.startSnapshot(snapshotID, senderID)
 		return
 	}
-	m.active[id].closed[from] = true
-	m.finishIfComplete(id)
+	module.activeSnapshots[snapshotID].closed[senderID] = true
+	module.finishIfComplete(snapshotID)
 }
-func (m *DIMEX_Module) finishIfComplete(id int) {
-	s := m.active[id]
-	for i := 0; i < m.n; i++ {
-		if i != m.id && !s.closed[i] {
+
+func (module *DIMEX_Module) finishIfComplete(snapshotID int) {
+	snapshot := module.activeSnapshots[snapshotID]
+	for peerID := 0; peerID < module.processCount; peerID++ {
+		if peerID != module.processID && !snapshot.closed[peerID] {
 			return
 		}
 	}
-	b, e := json.Marshal(s)
-	if e == nil {
-		b = append(b, '\n')
-		_, e = m.file.Write(b)
+	encoded, err := json.Marshal(snapshot)
+	if err == nil {
+		encoded = append(encoded, '\n')
+		_, err = module.snapshotFile.Write(encoded)
 	}
-	if e != nil {
-		panic(e)
+	if err != nil {
+		panic(err)
 	}
-	delete(m.active, id)
+	delete(module.activeSnapshots, snapshotID)
 }
